@@ -68,6 +68,26 @@ pub struct ZipFile<'a> {
     reader: ZipFileReader<'a>,
 }
 
+/// A struct for deferred reading of a zip file
+pub struct SoloZipFile {
+    compression_method: CompressionMethod,
+    data_start: u64,
+    compressed_size: u64,
+    crc32: u32,
+}
+
+/// A struct for reading a zip file
+pub struct SoloZipFileReader<R: Read> {
+    reader: SoloZipFileReaderAdapter<R>,
+}
+
+enum SoloZipFileReaderAdapter<R: Read> {
+    Stored(Crc32Reader<io::Take<R>>),
+    Deflated(Crc32Reader<flate2::read::DeflateDecoder<io::Take<R>>>),
+    #[cfg(feature = "bzip2")]
+    Bzip2(Crc32Reader<BzDecoder<io::Take<R>>>),
+}
+
 fn unsupported_zip_error<T>(detail: &'static str) -> ZipResult<T>
 {
     Err(ZipError::UnsupportedArchive(detail))
@@ -166,6 +186,35 @@ impl<R: Read+io::Seek> ZipArchive<R>
             _ => return unsupported_zip_error("Compression method not supported"),
         };
         Ok(ZipFile { reader: reader, data: data })
+    }
+
+    /// Search for a file entry by name
+    pub fn solo_by_name<'a>(&'a mut self, name: &str) -> ZipResult<SoloZipFile>
+    {
+        let index = match self.names_map.get(name) {
+            Some(index) => *index,
+            None => { return Err(ZipError::FileNotFound); },
+        };
+        self.solo_by_index(index)
+    }
+
+    /// Get a contained file by index
+    pub fn solo_by_index<'a>(&'a mut self, file_number: usize) -> ZipResult<SoloZipFile>
+    {
+        if file_number >= self.files.len() { return Err(ZipError::FileNotFound); }
+        let ref data = self.files[file_number];
+
+        if data.encrypted
+        {
+            return unsupported_zip_error("Encrypted files are not supported")
+        }
+
+        Ok(SoloZipFile {
+            compression_method: data.compression_method,
+            data_start: data.data_start,
+            compressed_size: data.compressed_size,
+            crc32: data.crc32,
+        })
     }
 
     /// Unwrap and return the inner reader object
@@ -348,4 +397,72 @@ impl<'a> Read for ZipFile<'a> {
      fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
          self.get_reader().read(buf)
      }
+}
+
+impl<R: Read> Read for SoloZipFileReaderAdapter<R>
+{
+     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+           &mut SoloZipFileReaderAdapter::Stored(ref mut r) => r.read(buf),
+           &mut SoloZipFileReaderAdapter::Deflated(ref mut r) => r.read(buf),
+           #[cfg(feature = "bzip2")]
+           &mut SoloZipFileReaderAdapter::Bzip2(ref mut r) => r.read(buf),
+        }
+     }
+}
+
+impl SoloZipFile
+{
+    /// Creates a reader for the content of the zip file
+    pub fn create_reader<R: Read + io::Seek>(&self, reader: R) -> ZipResult<SoloZipFileReader<R>>
+    {
+        SoloZipFileReaderAdapter::<R>::new(reader, self.compression_method, self.data_start, self.compressed_size, self.crc32)
+        .map(|r| SoloZipFileReader {
+            reader: r,
+        })
+    }
+}
+
+impl<R: Read + io::Seek> Read for SoloZipFileReader<R>
+{
+     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+         self.reader.read(buf)
+     }
+}
+
+impl<R: Read> SoloZipFileReaderAdapter<R>
+{
+    fn new<RS: Read + io::Seek>(mut reader: RS, compression_method: CompressionMethod, data_start: u64, compressed_size: u64, crc32: u32) -> ZipResult<SoloZipFileReaderAdapter<RS>>
+    {
+        try!(reader.seek(io::SeekFrom::Start(data_start)));
+        let limit_reader = reader.take(compressed_size);
+
+        let reader = match compression_method
+        {
+            CompressionMethod::Stored =>
+            {
+                SoloZipFileReaderAdapter::Stored(Crc32Reader::new(
+                    limit_reader,
+                    crc32))
+            },
+            CompressionMethod::Deflated =>
+            {
+                let deflate_reader = limit_reader.deflate_decode();
+                SoloZipFileReaderAdapter::Deflated(Crc32Reader::new(
+                    deflate_reader,
+                    crc32))
+            },
+            #[cfg(feature = "bzip2")]
+            CompressionMethod::Bzip2 =>
+            {
+                let bzip2_reader = BzDecoder::new(limit_reader);
+                SoloZipFileReaderAdapter::Bzip2(Crc32Reader::new(
+                    bzip2_reader,
+                    crc32))
+            },
+            _ => return unsupported_zip_error("Compression method not supported"),
+        };
+
+        Ok(reader)
+    }
 }
